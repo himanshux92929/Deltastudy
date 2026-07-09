@@ -4,37 +4,19 @@ on:
   repository_dispatch:
     types: [health-check]
   workflow_dispatch:
-    inputs:
-      repo_url:
-        description: 'GitHub repository URL to clone'
-        required: true
-        type: string
-      repo_ref:
-        description: 'Branch/tag/commit to checkout (optional)'
-        required: false
-        type: string
-        default: 'main'
+
+env:
+  REPO_URL: https://github.com/abhinai2244/cf-bypass  # <-- replace with your actual repo URL
+  REPO_REF: master
 
 jobs:
   build-and-run:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Resolve inputs (dispatch vs workflow_dispatch)
-        id: vars
-        run: |
-          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
-            echo "repo_url=${{ github.event.client_payload.repo_url }}" >> "$GITHUB_OUTPUT"
-            echo "repo_ref=${{ github.event.client_payload.repo_ref || 'main' }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "repo_url=${{ inputs.repo_url }}" >> "$GITHUB_OUTPUT"
-            echo "repo_ref=${{ inputs.repo_ref }}" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Clone target repository
         run: |
-          git clone --branch "${{ steps.vars.outputs.repo_ref }}" "${{ steps.vars.outputs.repo_url }}" cloned-repo || \
-          git clone "${{ steps.vars.outputs.repo_url }}" cloned-repo
+          git clone --branch "$REPO_REF" "$REPO_URL" cloned-repo
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
