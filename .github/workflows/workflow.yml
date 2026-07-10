@@ -1,7 +1,6 @@
-name: Run API Solver & Update Upstash
+name: Run External API Solver & Update Upstash
 
 on:
-  # Triggers the workflow via an external API call / cron-job
   repository_dispatch:
     types: [run-solver-task]
 
@@ -10,25 +9,69 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
+      # 1. Clone the OTHER person's public repository directly into the runner workspace
+      - name: Checkout External Public Repo
         uses: actions/checkout@v4
+        with:
+          repository: 'D3-vin/Turnstile-Solver-NEW'
 
-      - name: Build the Docker Image
-        run: docker build -t solver-app .
+      # 2. Dynamically create your Dockerfile inside their code folder
+      - name: Create Dockerfile dynamically
+        run: |
+          cat << 'EOF' > Dockerfile
+          FROM python:3.10-slim
 
+          # Update apt, install git, and patchright dependencies
+          RUN apt-get update && apt-get install -y git \
+              && pip install --no-cache-dir patchright \
+              && patchright install-deps \
+              && rm -rf /var/lib/apt/lists/*
+
+          # Set up Hugging Face non-root user
+          RUN useradd -m -u 1000 user
+          USER user
+          ENV HOME=/home/user \
+              PATH=/home/user/.local/bin:$PATH
+          WORKDIR $HOME/app
+
+          # Copy the external repo's cloned files into the container
+          COPY --chown=user:user . .
+
+          # Install requirements from the external repo
+          RUN pip install --no-cache-dir -r requirements.txt
+
+          # Download Chromium browser binaries
+          RUN python -m patchright install chromium
+
+          # Run their script
+          CMD ["python", "api_solver.py", "--port", "7860"]
+          EOF
+
+      # 3. Set up Docker Buildx for ultra-fast GitHub layer caching
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 4. Build the image (Downloads Chromium/pip packages on 1st run, uses cache on 2nd)
+      - name: Build Docker Image with Cache
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: solver-app:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # 5. Run the container
       - name: Run the Docker Container
-        # The --rm flag ensures the container cleans itself up after exiting
-        run: docker run --rm solver-app
+        run: docker run --rm solver-app:latest
 
-      - name: Update Upstash Redis (Constant Endpoint)
-        # Only runs if the previous Docker step completes successfully
+      # 6. Overwrite the status at your constant Upstash Redis endpoint
+      - name: Update Upstash Redis
         if: success()
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
+          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.Secrets.UPSTASH_REDIS_REST_TOKEN }}
         run: |
-          # Using the SET command overwrites the key rather than creating a new entry.
-          # This keeps the data at a single, constant endpoint.
           curl -s -X POST \
             "${UPSTASH_REDIS_REST_URL}/set/solver_status/success" \
             -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}"
