@@ -50,10 +50,10 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # 5. Spin up the container in the BACKGROUND (-d) and expose port 7860
+      # 5. Spin up the container, mapping runner host port 7860 to container port 3000
       - name: Start Docker Container in Background
         run: |
-          docker run -d -p 7860:7860 --name solver-container solver-app:latest
+          docker run -d -p 7860:3000 --name solver-container solver-app:latest
           echo "Giving the Bun API server 10 seconds to spin up completely..."
           sleep 10
 
