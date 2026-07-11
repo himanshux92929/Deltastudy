@@ -42,46 +42,13 @@ jobs:
 
       - name: Patch index.ts getPage to not conflict with turnstile interceptor
         run: |
-          # Remove the pre-set request interceptor from getPage() in index.ts
-          # It conflicts when turnstile.ts tries to set its own interceptor on the same page
-          python3 - << 'PYEOF'
-          import re
-
-          with open("src/index.ts", "r") as f:
-              content = f.read()
-
-          # Remove the conflicting interceptor block inside getPage()
-          old = """    await page.goto('about:blank');
-      await page.setRequestInterception(true);
-      page.on('request', async (req: any) => {
-          const type = req.resourceType();
-          if (["image", "stylesheet", "font", "media"].includes(type)) {
-              await req.abort();
-          } else {
-              await req.continue();
-          }
-      });"""
-
-          new = """    await page.goto('about:blank');"""
-
-          if old in content:
-              content = content.replace(old, new)
-              with open("src/index.ts", "w") as f:
-                  f.write(content)
-              print("index.ts patched: removed conflicting interceptor from getPage()")
-          else:
-              print("Pattern not found exactly, trying flexible match...")
-              # Flexible fallback using regex
-              pattern = r"await page\.goto\('about:blank'\);\s+await page\.setRequestInterception\(true\);.*?}\s+\}\);"
-              replacement = "await page.goto('about:blank');"
-              result = re.sub(pattern, replacement, content, flags=re.DOTALL)
-              if result != content:
-                  with open("src/index.ts", "w") as f:
-                      f.write(result)
-                  print("index.ts patched via regex fallback")
-              else:
-                  print("WARNING: Could not patch index.ts, interceptor conflict may persist")
-          PYEOF
+          # Use perl to remove the conflicting setRequestInterception block from getPage()
+          # perl -0777 loads the whole file so we can match across multiple lines
+          perl -0777 -i -pe \
+            's/await page\.goto\('"'"'about:blank'"'"'\);\s+await page\.setRequestInterception\(true\);.*?page\.on\('"'"'request'"'"'.*?\}\);//s' \
+            src/index.ts
+          echo "index.ts interceptor block removed"
+          grep -n "setRequestInterception" src/index.ts && echo "WARNING: block still present" || echo "Confirmed: block gone"
 
       - name: Start Server & Wait for Readiness
         run: |
@@ -229,26 +196,6 @@ jobs:
             -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}" \
             -H "Content-Type: application/json" \
             -d "[\"SET\", \"solver_cookie\", \"$COOKIE\"]" 2>&1)
-
-          HTTP_CODE=$(echo "$UPSTASH_RESP" | tail -1)
-          BODY=$(echo "$UPSTASH_RESP" | sed '$d')
-
-          echo "Upstash status: $HTTP_CODE"
-          echo "Upstash response: $BODY"
-
-          if [ "$HTTP_CODE" != "200" ]; then
-            echo "ERROR: Upstash update failed"
-            exit 1
-          fi
-
-          echo "Cookie stored."
-        if: env.COOKIE != ''
-        env:
-          UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
-          UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-        run: |
-          echo "Storing cookie in Upstash..."
-          UPSTASH_RESP=$(curl -s -w "\n%{http_code}" -X POST "${UPSTASH_REDIS_REST_URL}"             -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}"             -H "Content-Type: application/json"             -d "[\"SET\", \"solver_cookie\", \"$COOKIE\"]" 2>&1)
 
           HTTP_CODE=$(echo "$UPSTASH_RESP" | tail -1)
           BODY=$(echo "$UPSTASH_RESP" | sed '$d')
