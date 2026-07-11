@@ -15,133 +15,65 @@ jobs:
         with:
           repository: 'abhinai2244/cf-bypass'
 
-      - name: Setup Bun Environment
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Install Dependencies
-        run: bun install
-
-      - name: Install Google Chrome Stable (bypass Snap entirely)
+      - name: Build Docker Image (as recommended by README)
         run: |
-          # Remove any snap-based chromium packages that might be partially installed
-          sudo apt-get remove -y chromium-browser chromium-chromedriver 2>/dev/null || true
-          
-          # Install Google Chrome Stable from Google's own repo (clean .deb, no snap)
-          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo gpg --dearmor -o /usr/share/keyrings/google-chrome-keyring.gpg
-          echo "deb [signed-by=/usr/share/keyrings/google-chrome-keyring.gpg] https://dl.google.com/linux/chrome/deb/ stable main" | sudo tee /etc/apt/sources.list.d/google-chrome.list
-          sudo apt-get update
-          sudo apt-get install -y --fix-missing google-chrome-stable xvfb
-          
-          # Verify the binary exists and show version
-          CHROME_PATH=$(which google-chrome-stable 2>/dev/null || echo "/usr/bin/google-chrome-stable")
-          echo "Chrome path: $CHROME_PATH"
-          $CHROME_PATH --version || echo "WARNING: Chrome binary not functional"
-          echo "CHROME_PATH=$CHROME_PATH" >> $GITHUB_ENV
+          echo "Building Docker image..."
+          docker build -t cf-bypass-solver .
+          echo "Docker image built successfully."
 
-      - name: Start Server & Wait for Readiness
+      - name: Start Docker Container
         run: |
-          pkill -f "bun start" 2>/dev/null || true
-          pkill -f Xvfb 2>/dev/null || true
-          sleep 2
+          # Clean up any old container
+          docker rm -f cf-bypass-container 2>/dev/null || true
 
-          Xvfb :99 -screen 0 1024x768x24 &
-          export DISPLAY=:99
-          echo "DISPLAY=:99" >> $GITHUB_ENV
+          # Run the container in detached mode, mapping port 3000
+          docker run -d \
+            --name cf-bypass-container \
+            -p 3000:3000 \
+            -e PORT=3000 \
+            -e NODE_ENV=production \
+            -e timeOut=180000 \
+            cf-bypass-solver
 
-          export PORT=3000
-          export NODE_ENV=production
-          export timeOut=180000
-          echo "PORT=3000" >> $GITHUB_ENV
-          echo "timeOut=180000" >> $GITHUB_ENV
-          echo "NODE_ENV=production" >> $GITHUB_ENV
+          echo "Container started. Waiting for server readiness..."
 
-          bun start > /tmp/server.log 2>&1 &
-          SERVER_PID=$!
-          echo "SERVER_PID=$SERVER_PID" >> $GITHUB_ENV
-          echo "Server PID: $SERVER_PID"
-
-          echo "Waiting for port 3000..."
-          MAX_WAIT=120
-          ELAPSED=0
-          while [ $ELAPSED -lt $MAX_WAIT ]; do
+          # Wait for port 3000 inside the container
+          for i in $(seq 1 60); do
             if curl -s -o /dev/null --max-time 3 "http://127.0.0.1:3000" 2>/dev/null; then
-              echo "Port 3000 accepting connections after ${ELAPSED}s"
+              echo "Port 3000 accepting connections after $((i * 2))s"
               break
             fi
-            if ! kill -0 $SERVER_PID 2>/dev/null; then
-              echo "ERROR: Server process died! Last 20 lines:"
-              tail -20 /tmp/server.log
+            # Check if container is still running
+            if ! docker ps | grep -q cf-bypass-container; then
+              echo "ERROR: Container died during startup! Logs:"
+              docker logs cf-bypass-container
               exit 1
             fi
             sleep 2
-            ELAPSED=$((ELAPSED + 2))
-            echo "Still waiting... (${ELAPSED}s elapsed)"
           done
 
-          if [ $ELAPSED -ge $MAX_WAIT ]; then
-            echo "ERROR: Server never became ready after ${MAX_WAIT}s"
-            tail -20 /tmp/server.log
-            exit 1
-          fi
-
-          echo "Waiting for browser initialization..."
-          MAX_BROWSER_WAIT=60
-          BROWSER_ELAPSED=0
-          while [ $BROWSER_ELAPSED -lt $MAX_BROWSER_WAIT ]; do
-            if grep -q "Browser initialized" /tmp/server.log 2>/dev/null; then
-              echo "Browser initialized after ${BROWSER_ELAPSED}s"
+          # Wait for "Browser initialized" in container logs
+          echo "Waiting for browser initialization inside container..."
+          for i in $(seq 1 40); do
+            if docker logs cf-bypass-container 2>&1 | grep -q "Browser initialized"; then
+              echo "Browser initialized after $((i * 2))s"
               break
             fi
-            if ! kill -0 $SERVER_PID 2>/dev/null; then
-              echo "ERROR: Server died during browser init! Last 20 lines:"
-              tail -20 /tmp/server.log
+            if ! docker ps | grep -q cf-bypass-container; then
+              echo "ERROR: Container died during browser init! Logs:"
+              docker logs cf-bypass-container
               exit 1
             fi
             sleep 2
-            BROWSER_ELAPSED=$((BROWSER_ELAPSED + 2))
           done
 
-          if [ $BROWSER_ELAPSED -ge $MAX_BROWSER_WAIT ]; then
-            echo "WARNING: 'Browser initialized' not seen after ${MAX_BROWSER_WAIT}s — proceeding anyway"
-          fi
-
-          echo "Server fully ready. Browser is initialized, proceeding to solve."
+          echo "Server fully ready inside Docker container."
 
       - name: Solve Turnstile
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-          DISPLAY: :99
-          CHROME_PATH: ${{ env.CHROME_PATH }}
-          PORT: 3000
-          timeOut: 180000
-          NODE_ENV: production
         run: |
-          restart_server() {
-            echo ">>> Restarting server..."
-            pkill -f "bun start" 2>/dev/null || true
-            sleep 2
-            bun start > /tmp/server.log 2>&1 &
-            NEW_PID=$!
-            echo "New server PID: $NEW_PID"
-            for j in $(seq 1 40); do
-              if curl -s -o /dev/null --max-time 3 "http://127.0.0.1:3000" 2>/dev/null; then
-                echo "Server port alive after $((j * 2))s"
-                break
-              fi
-              sleep 2
-            done
-            for j in $(seq 1 30); do
-              if grep -q "Browser initialized" /tmp/server.log 2>/dev/null; then
-                echo "Browser re-initialized after $((j * 2))s"
-                break
-              fi
-              sleep 2
-            done
-          }
-
           TOKEN=""
           for i in 1 2 3 4 5; do
             echo ""
@@ -149,9 +81,26 @@ jobs:
             echo "=== Turnstile Attempt $i of 5 ==="
             echo "=========================================="
 
-            if ! curl -s -o /dev/null --max-time 3 "http://127.0.0.1:3000" 2>/dev/null; then
-              echo "Server unresponsive — restarting before attempt..."
-              restart_server
+            # Check if container is alive
+            if ! docker ps | grep -q cf-bypass-container; then
+              echo "Container died! Restarting..."
+              docker rm -f cf-bypass-container 2>/dev/null || true
+              docker run -d \
+                --name cf-bypass-container \
+                -p 3000:3000 \
+                -e PORT=3000 \
+                -e NODE_ENV=production \
+                -e timeOut=180000 \
+                cf-bypass-solver
+              echo "Waiting for container to be ready..."
+              sleep 15
+              for j in $(seq 1 30); do
+                if curl -s -o /dev/null --max-time 3 "http://127.0.0.1:3000" 2>/dev/null; then
+                  echo "Container back online after $((j * 2))s"
+                  break
+                fi
+                sleep 2
+              done
             fi
 
             echo "Calling /cloudflare (curl timeout: 240s)..."
@@ -163,9 +112,8 @@ jobs:
 
             if [ "$RESP" = "CURL_FAILED" ]; then
               echo "Curl returned nothing (timeout or connection refused)"
-              echo "Server log tail:"
-              tail -20 /tmp/server.log
-              restart_server
+              echo "Container logs (last 20 lines):"
+              docker logs cf-bypass-container 2>&1 | tail -20
               continue
             fi
 
@@ -178,16 +126,13 @@ jobs:
               break
             fi
 
-            echo "No token in response. Checking for server errors..."
-            if echo "$RESP" | grep -qE "Timeout Error|error|500|crash"; then
-              echo "Server-side error detected — restarting before next attempt"
-              tail -20 /tmp/server.log
-              restart_server
-            else
-              echo "Unexpected response — will retry without restart"
+            echo "No valid token in response."
+            if echo "$RESP" | grep -qE "Timeout Error|error|500"; then
+              echo "Server-side error detected — container logs:"
+              docker logs cf-bypass-container 2>&1 | tail -20
             fi
 
-            sleep 5
+            sleep 10
           done
 
           if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
@@ -195,8 +140,8 @@ jobs:
             echo "=========================================="
             echo "ERROR: All 5 attempts failed to get token"
             echo "=========================================="
-            echo "Complete server log:"
-            cat /tmp/server.log
+            echo "Full container logs:"
+            docker logs cf-bypass-container 2>&1
             exit 1
           fi
 
