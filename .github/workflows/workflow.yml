@@ -10,45 +10,60 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Clone the repository into the runner workspace
       - name: Checkout External Public Repo
         uses: actions/checkout@v4
         with:
           repository: 'abhinai2244/cf-bypass'
 
-      # 2. Setup Bun natively on the host machine
       - name: Setup Bun Environment
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
-      # 3. Install dependencies directly on the host
-      - name: Install Project Dependencies
+      - name: Install Dependencies
         run: bun install
 
-      # 4. Start the server letting the app natively spawn its own Xvfb session
-      - name: Start API Server on Host
+      - name: Install Xvfb and Chrome dependencies
         run: |
-          # Use the pre-installed Chrome binary path on GitHub Actions runners
-          export CHROME_PATH="/usr/bin/google-chrome"
+          sudo apt-get update
+          sudo apt-get install -y xvfb libxcomposite1 libxdamage1 libxrandr2 libgbm1 libpango-1.0-0 libcairo2 libatk-bridge2.0-0
+          google-chrome --version || echo "Chrome not found, installing..."
+          wget -q -O - https://dl-ssl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          sudo sh -c 'echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google.list'
+          sudo apt-get update
+          sudo apt-get install -y google-chrome-stable
+
+      - name: Start API Server with Xvfb
+        run: |
+          export CHROME_PATH="/usr/bin/google-chrome-stable"
           export PORT=3000
           export NODE_ENV=production
           
-          # Run directly WITHOUT xvfb-run. The codebase sets 'disableXvfb: false', 
-          # meaning it automatically launches its own internal Xvfb setup.
-          bun start &
+          # Force Xvfb to run properly
+          Xvfb :99 -screen 0 1024x768x24 &
+          export DISPLAY=:99
           
-          echo "Giving the Bun API server 20 seconds to spin up and hook the browser..."
-          sleep 20
+          # Start the server with explicit Xvfb flag
+          bun start --disableXvfb=false &
+          
+          # Wait with health check pings
+          echo "Waiting for server to be ready..."
+          for i in {1..30}; do
+            if curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:3000/health | grep -q "200"; then
+              echo "Server is ready!"
+              break
+            fi
+            echo "Attempt $i/30 - waiting..."
+            sleep 2
+          done
 
-      # 5. Execute the POST request, retry logic, cookie-extraction, and Upstash pipeline
       - name: Orchestrate API Tasks & Update Upstash
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
         run: |
           attempt=1
-          max_attempts=3
+          max_attempts=5
           success=false
           token=""
 
@@ -57,38 +72,56 @@ jobs:
             echo "STARTING ATTEMPT $attempt OF $max_attempts"
             echo "========================================="
             
-            # Send POST request directly to port 3000 on localhost
-            INIT_RESP=$(curl -s -X POST "http://127.0.0.1:3000/cloudflare" \
+            # Add timeout and better error handling
+            INIT_RESP=$(curl -s -m 60 -X POST "http://127.0.0.1:3000/cloudflare" \
               -H "Content-Type: application/json" \
-              -d '{"mode": "turnstile", "domain": "https://deltastudy.site/verify", "siteKey": "0x4AAAAAADnpjMgvQPlaYYog"}' || echo "CURL_FAILED")
+              -d '{"mode": "turnstile", "domain": "https://deltastudy.site/verify", "siteKey": "0x4AAAAAADnpjMgvQPlaYYog"}' 2>&1)
             
-            echo "Response: $INIT_RESP"
+            CURL_EXIT=$?
             
-            if [ "$INIT_RESP" = "CURL_FAILED" ]; then
-              echo "Network connection to API server failed."
-              CODE="500"
-            else
-              # Parse the code and token safely from the response
-              CODE=$(echo "$INIT_RESP" | jq -r '.code // empty')
-              EXTRACTED_TOKEN=$(echo "$INIT_RESP" | jq -r '.token // empty')
+            if [ $CURL_EXIT -ne 0 ] || [ -z "$INIT_RESP" ]; then
+              echo "CURL failed with exit code $CURL_EXIT"
+              echo "Response: $INIT_RESP"
+              attempt=$((attempt+1))
+              sleep 10
+              continue
             fi
             
-            # Verify token payload match conditions cleanly
-            if [ -n "$EXTRACTED_TOKEN" ] && [ "$EXTRACTED_TOKEN" != "null" ] && [ "$CODE" != "500" ]; then
-              token=$EXTRACTED_TOKEN
-              echo "Task success! Extracted token value."
-              success=true
-              break 
+            echo "Raw response: $INIT_RESP"
+            
+            # Safely parse JSON without failing on empty
+            if echo "$INIT_RESP" | jq -e . >/dev/null 2>&1; then
+              CODE=$(echo "$INIT_RESP" | jq -r '.code // "500"')
+              EXTRACTED_TOKEN=$(echo "$INIT_RESP" | jq -r '.token // ""')
+              MESSAGE=$(echo "$INIT_RESP" | jq -r '.message // ""')
             else
-              echo "Attempt $attempt failed or returned an empty response. Retrying in 5 seconds..."
+              echo "Invalid JSON response"
               attempt=$((attempt+1))
-              sleep 5
+              sleep 10
+              continue
+            fi
+            
+            echo "Parsed code: $CODE"
+            echo "Parsed token: ${EXTRACTED_TOKEN:0:20}..."
+            
+            # Validate token properly
+            if [ -n "$EXTRACTED_TOKEN" ] && [ "$EXTRACTED_TOKEN" != "null" ] && [ "$CODE" = "200" ]; then
+              token="$EXTRACTED_TOKEN"
+              echo "✅ Task success! Valid token extracted."
+              success=true
+              break
+            else
+              echo "❌ Attempt $attempt failed. Code: $CODE, Message: $MESSAGE"
+              attempt=$((attempt+1))
+              if [ $attempt -le $max_attempts ]; then
+                echo "Retrying in 10 seconds..."
+                sleep 10
+              fi
             fi
           done
 
-          # Critical check: Did we secure a token?
           if [ "$success" != "true" ]; then
-            echo "Error: Failed to obtain a token after $max_attempts global attempts."
+            echo "❌ Error: Failed to obtain a token after $max_attempts attempts."
             exit 1
           fi
 
@@ -96,25 +129,35 @@ jobs:
           echo "POSTING TOKEN AND EXTRACTING COOKIE"
           echo "========================================="
           
-          # Send token to the target and isolate the 'set-cookie' header
-          COOKIE=$(curl -sI -X POST https://deltastudy.site/api/turnstile/verify \
+          # Better cookie extraction with timeout
+          COOKIE_RESP=$(curl -s -m 30 -i -X POST https://deltastudy.site/api/turnstile/verify \
             -H "Content-Type: application/json" \
-            -d "{\"token\":\"$token\"}" | grep -i '^set-cookie:' | head -n 1 | sed 's/^[^:]*:\s*//' | tr -d '\r\n')
-
+            -d "{\"token\":\"$token\"}" 2>&1)
+          
+          COOKIE=$(echo "$COOKIE_RESP" | grep -i '^set-cookie:' | head -n 1 | sed 's/^[^:]*:\s*//' | tr -d '\r\n' | cut -d';' -f1)
+          
           if [ -z "$COOKIE" ]; then
-            echo "Error: Request succeeded but no 'set-cookie' header was returned."
+            echo "❌ Error: No 'set-cookie' header found."
+            echo "Full response headers:"
+            echo "$COOKIE_RESP" | head -20
             exit 1
           fi
-          echo "Successfully captured target cookie payload."
+          
+          echo "✅ Successfully captured cookie: ${COOKIE:0:50}..."
 
           echo "========================================="
-          echo "UPDATING UPSTASH REDIS CONSTANT ENDPOINT"
+          echo "UPDATING UPSTASH REDIS"
           echo "========================================="
           
-          # Overwrite the key using Upstash JSON Array syntax.
-          curl -s -X POST "${UPSTASH_REDIS_REST_URL}" \
+          # Upstash SET operation with proper error handling
+          UPSTASH_RESP=$(curl -s -m 30 -X POST "${UPSTASH_REDIS_REST_URL}" \
             -H "Authorization: Bearer ${UPSTASH_REDIS_REST_TOKEN}" \
             -H "Content-Type: application/json" \
-            -d "[\"SET\", \"solver_cookie\", \"$COOKIE\"]"
-
-          echo "Upstash Redis update complete!"
+            -d "[\"SET\", \"solver_cookie\", \"$COOKIE\"]")
+          
+          if echo "$UPSTASH_RESP" | jq -e '.result == "OK"' >/dev/null 2>&1; then
+            echo "✅ Upstash update successful!"
+          else
+            echo "⚠️ Upstash update may have failed: $UPSTASH_RESP"
+            # Don't exit - cookie already captured
+          fi
