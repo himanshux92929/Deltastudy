@@ -26,113 +26,109 @@ jobs:
       - name: Install Xvfb and Chrome
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb
-          google-chrome-stable --version || sudo apt-get install -y google-chrome-stable
+          sudo apt-get install -y xvfb google-chrome-stable
 
-      - name: Start Server with Debug Logging
+      - name: Create Standalone Solver Script
         run: |
-          pkill -f "bun start" || true
-          pkill -f Xvfb || true
+          cat > solve.js << 'EOF'
+          const puppeteer = require('puppeteer-extra');
+          const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+          puppeteer.use(StealthPlugin());
           
-          export CHROME_PATH="/usr/bin/google-chrome-stable"
-          export PORT=3000
-          export NODE_ENV=production
+          const siteKey = '0x4AAAAAADnpjMgvQPlaYYog';
+          const targetUrl = 'https://deltastudy.site/verify';
           
-          Xvfb :99 -screen 0 1024x768x24 &
-          export DISPLAY=:99
-          sleep 3
+          async function solveTurnstile() {
+            console.log('Launching browser...');
+            const browser = await puppeteer.launch({
+              headless: true,
+              args: [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-gpu'
+              ],
+              executablePath: '/usr/bin/google-chrome-stable'
+            });
+            
+            const page = await browser.newPage();
+            await page.goto(targetUrl, { waitUntil: 'networkidle2', timeout: 60000 });
+            console.log('Page loaded, waiting for turnstile...');
+            
+            // Wait for turnstile to render and solve
+            await page.waitForSelector('.cf-turnstile iframe', { timeout: 30000 }).catch(() => {});
+            await page.waitForTimeout(5000);
+            
+            // Check for token in page or console
+            const token = await page.evaluate(() => {
+              return window.turnstile?.getResponse() || null;
+            }).catch(() => null);
+            
+            if (token) {
+              console.log('Token found:', token.substring(0, 30) + '...');
+              console.log(JSON.stringify({ code: 200, token: token }));
+            } else {
+              console.log('No token found, trying to capture from network');
+              // Fallback: capture from network responses
+              let capturedToken = null;
+              const client = await page.target().createCDPSession();
+              await client.send('Network.enable');
+              client.on('Network.responseReceived', (params) => {
+                if (params.response.url.includes('turnstile') || params.response.url.includes('cf')) {
+                  console.log('Intercepted response:', params.response.url);
+                }
+              });
+              
+              // Wait and retry
+              await page.waitForTimeout(15000);
+              const token2 = await page.evaluate(() => {
+                return window.turnstile?.getResponse() || null;
+              });
+              
+              if (token2) {
+                console.log('Token found on retry:', token2.substring(0, 30) + '...');
+                console.log(JSON.stringify({ code: 200, token: token2 }));
+              } else {
+                console.log(JSON.stringify({ code: 500, message: 'No token captured' }));
+              }
+            }
+            
+            await browser.close();
+          }
           
-          # Start server and capture ALL output including stderr
-          bun start 2>&1 | tee server.log &
-          SERVER_PID=$!
-          
-          echo "Waiting for port 3000..."
-          for i in {1..40}; do
-            if ss -lnt | grep -q ":3000"; then
-              echo "✅ Port ready"
-              # Extra time for Chrome to fully initialize
-              sleep 20
-              break
-            fi
-            echo "Waiting... $i/40"
-            sleep 3
-          done
-          
-          if ! ss -lnt | grep -q ":3000"; then
-            echo "❌ Port never bound"
-            cat server.log
-            exit 1
-          fi
+          solveTurnstile().catch(err => {
+            console.error('Error:', err.message);
+            console.log(JSON.stringify({ code: 500, message: err.message }));
+            process.exit(1);
+          });
+          EOF
 
-      - name: Solve with Multiple Payload Variations
+      - name: Solve Turnstile Directly
         env:
           UPSTASH_REDIS_REST_URL: ${{ secrets.UPSTASH_REDIS_REST_URL }}
           UPSTASH_REDIS_REST_TOKEN: ${{ secrets.UPSTASH_REDIS_REST_TOKEN }}
-        timeout-minutes: 15
+          DISPLAY: :99
+        timeout-minutes: 10
         run: |
-          max_attempts=12
-          delay=10
-          token=""
+          # Start Xvfb
+          Xvfb :99 -screen 0 1024x768x24 &
+          sleep 3
           
-          # Try all common payload variations
-          PAYLOADS=(
-            '{"mode":"turnstile","domain":"https://deltastudy.site/verify","siteKey":"0x4AAAAAADnpjMgvQPlaYYog"}'
-            '{"mode":"turnstile","url":"https://deltastudy.site/verify","sitekey":"0x4AAAAAADnpjMgvQPlaYYog"}'
-            '{"mode":"turnstile","domain":"https://deltastudy.site/verify","sitekey":"0x4AAAAAADnpjMgvQPlaYYog"}'
-            '{"mode":"turnstile","url":"https://deltastudy.site/verify","siteKey":"0x4AAAAAADnpjMgvQPlaYYog"}'
-          )
+          # Run the solver directly
+          echo "Running solver..."
+          RESULT=$(bun run solve.js 2>&1)
+          echo "$RESULT"
           
-          for attempt in $(seq 1 $max_attempts); do
-            echo "========================================="
-            echo "ATTEMPT $attempt/$max_attempts"
-            echo "========================================="
-            
-            # Rotate payloads
-            payload_index=$(( (attempt - 1) % ${#PAYLOADS[@]} ))
-            payload="${PAYLOADS[$payload_index]}"
-            echo "Payload: $payload"
-            
-            # Send request with verbose output to see what's happening
-            RESP=$(curl -s -m 180 -v -X POST "http://127.0.0.1:3000/cloudflare" \
-              -H "Content-Type: application/json" \
-              -d "$payload" 2>&1)
-            
-            curl_exit=$?
-            echo "Curl exit: $curl_exit"
-            
-            # Also check server logs for any errors
-            echo "Server log tail:"
-            tail -20 server.log || echo "No logs"
-            
-            if echo "$RESP" | jq -e . >/dev/null 2>&1; then
-              CODE=$(echo "$RESP" | jq -r '.code // ""')
-              EXTRACTED=$(echo "$RESP" | jq -r '.token // ""')
-              
-              echo "Response code: $CODE"
-              
-              if [ "$CODE" = "200" ] && [ -n "$EXTRACTED" ] && [ "$EXTRACTED" != "null" ]; then
-                token="$EXTRACTED"
-                echo "✅ Token captured!"
-                break
-              else
-                echo "❌ Not valid yet"
-              fi
-            else
-              echo "❌ Invalid JSON or empty response"
-              echo "Raw: ${RESP:0:300}"
-            fi
-            
-            echo "Retrying in ${delay}s..."
-            sleep $delay
-            delay=$((delay * 2))
-            [ $delay -gt 120 ] && delay=120
-          done
+          # Extract token from JSON output
+          TOKEN=$(echo "$RESULT" | grep -o '{"code":200,"token":"[^"]*"}' | sed 's/{"code":200,"token":"\(.*\)"}/\1/')
           
-          if [ -z "$token" ]; then
-            echo "❌ Failed all attempts"
-            cat server.log
+          if [ -z "$TOKEN" ]; then
+            echo "❌ Failed to extract token"
+            echo "Full output: $RESULT"
             exit 1
           fi
+          
+          echo "✅ Token: ${TOKEN:0:30}..."
           
           echo "========================================="
           echo "EXTRACTING COOKIE"
@@ -140,7 +136,7 @@ jobs:
           
           COOKIE_RESP=$(curl -s -m 30 -i -X POST https://deltastudy.site/api/turnstile/verify \
             -H "Content-Type: application/json" \
-            -d "{\"token\":\"$token\"}")
+            -d "{\"token\":\"$TOKEN\"}")
           
           COOKIE=$(echo "$COOKIE_RESP" | grep -i '^set-cookie:' | head -1 | sed 's/^[^:]*:\s*//' | cut -d';' -f1 | tr -d '\r\n')
           
